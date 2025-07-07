@@ -5,9 +5,69 @@ class Program
 {
     static async Task Main(string[] args)
     {
-        await GetVideoLinks();
+        await GetVideoLinksAndViews();
         // await GetVideoStuff();
     }
+
+    static async Task GetVideoLinksAndViews()
+    {
+        var profileUrl = "https://www.tiktok.com/@22gradusi";
+        int targetCount = 10;
+        int scrollDelayMs = 1200;
+
+        using var playwright = await Playwright.CreateAsync();
+        await using var browser = await playwright.Chromium.LaunchAsync(new() { Headless = false });
+        var context = await browser.NewContextAsync();
+        var page = await context.NewPageAsync();
+
+        await page.GotoAsync(profileUrl, new() { WaitUntil = WaitUntilState.NetworkIdle });
+        Console.WriteLine("✅ Page loaded. Starting scroll…");
+
+        var results = new List<(string Url, string Views)>();
+        int scrolls = 0;
+
+        while (results.Count < targetCount && scrolls < 300)
+        {
+            // Ensure enough items have loaded
+            await page.WaitForSelectorAsync("div[data-e2e='user-post-item']");
+
+            // Grab all containers
+            var items = await page.QuerySelectorAllAsync("div[data-e2e='user-post-item']");
+
+            foreach (var item in items)
+            {
+                // Extract the <a> href
+                var linkHandle = await item.QuerySelectorAsync("a[href*='/video/']");
+                if (linkHandle == null) continue;
+                var url = await linkHandle.GetAttributeAsync("href");
+
+                // Extract the <strong> text (views)
+                var viewsHandle = await item.QuerySelectorAsync("strong[data-e2e='video-views']");
+                var views = viewsHandle is not null
+                    ? (await viewsHandle.InnerTextAsync()).Trim()
+                    : "N/A";
+
+                // Avoid duplicates
+                if (results.Any(r => r.Url == url)) continue;
+                results.Add((url, views));
+                Console.WriteLine($"[{results.Count}] {url}  —  {views}");
+
+                if (results.Count >= targetCount)
+                    break;
+            }
+
+            if (results.Count >= targetCount)
+                break;
+
+            // Scroll to load more videos
+            await page.EvaluateAsync("window.scrollBy(0, window.innerHeight)");
+            await Task.Delay(scrollDelayMs);
+            scrolls++;
+        }
+
+        Console.WriteLine($"✅ Finished. Collected {results.Count} items.");
+    }
+
     static async Task GetVideoLinks()
     {
         var profileUrl = "https://www.tiktok.com/@22gradusi"; // 👈 change this
