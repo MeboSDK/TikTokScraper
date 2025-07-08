@@ -1,18 +1,22 @@
 ﻿using Microsoft.Playwright;
 using System.Text;
+using TikTokScraper;
 
 class Program
 {
     static async Task Main(string[] args)
     {
-        await GetVideoLinksAndViews();
-        // await GetVideoStuff();
+        var username = TakeUsername();
+        var result = await GetVideoLinksAndViews(username);
+        var metadata =  await GetVideoStuff(result);
+
+        CreateCSVFile(metadata, username);
     }
 
-    static async Task GetVideoLinksAndViews()
+    static async Task<List<(string Url, string Views)>> GetVideoLinksAndViews(string username)
     {
-        var profileUrl = "https://www.tiktok.com/@22gradusi";
-        int targetCount = 10;
+        var profileUrl = "https://www.tiktok.com/@" + username;
+        int targetCount = 1435;
         int scrollDelayMs = 1200;
 
         using var playwright = await Playwright.CreateAsync();
@@ -50,6 +54,7 @@ class Program
                 // Avoid duplicates
                 if (results.Any(r => r.Url == url)) continue;
                 results.Add((url, views));
+                
                 Console.WriteLine($"[{results.Count}] {url}  —  {views}");
 
                 if (results.Count >= targetCount)
@@ -66,9 +71,116 @@ class Program
         }
 
         Console.WriteLine($"✅ Finished. Collected {results.Count} items.");
+
+        return results;
     }
 
-    static async Task GetVideoLinks()
+    static async Task<List<VideoMetadata>> GetVideoStuff(List<(string Url, string Views)> urlViews)
+    {
+        List<VideoMetadata> videoMetadatas = new();
+        using var playwright = await Playwright.CreateAsync();
+        var browser = await playwright.Chromium.LaunchAsync(new() { Headless = false });
+        var context = await browser.NewContextAsync();
+        var page = await context.NewPageAsync();
+
+        Console.WriteLine($"🔍 Scraping {urlViews.Count} videos...\n");
+
+        foreach (var urlView in urlViews)
+        {
+            try
+            {
+                await page.GotoAsync(urlView.Url, new() { WaitUntil = WaitUntilState.NetworkIdle, Timeout = 30000 });
+                await page.WaitForTimeoutAsync(1500); // Let JS render fully
+
+                string likes = await GetText(page, "strong[data-e2e='like-count']");
+                string comments = await GetText(page, "strong[data-e2e='comment-count']");
+                string shares = await GetText(page, "strong[data-e2e='share-count']");
+
+                VideoMetadata videoMetadata = new VideoMetadata
+                {
+                    Url = urlView.Url,
+                    Views = urlView.Views,
+                    Likes = likes,
+                    Comments = comments,
+                    Shares = shares,
+                    Caption = await GetText(page, "h1[data-e2e='video-caption']"),
+                    UploadTime = await GetText(page, "span[data-e2e='video-upload-time']")
+                };  
+
+                string result = $"{urlView.Url} : comments({comments}), likes({likes}), shares({shares}), views({urlView.Views})";
+
+                Console.WriteLine(result);
+
+                videoMetadatas.Add(videoMetadata);
+            }
+            catch (Exception ex)
+            {
+                string failMsg = $"❌ Failed to scrape {urlView.Url}: {ex.Message}";
+                Console.WriteLine(failMsg);
+            }
+        }
+
+        Console.WriteLine($"\n✅ Done. Saved to List.");
+        return videoMetadatas;
+    }
+    
+    static async Task<string> GetText(IPage page, string selector)
+    {
+        try
+        {
+            var el = await page.QuerySelectorAsync(selector);
+            return el != null ? (await el.InnerTextAsync()) : "N/A";
+        }
+        catch
+        {
+            return "N/A";
+        }
+    }
+    
+    static void CreateCSVFile(List<VideoMetadata> metadatas, string userName)
+    {
+        string desktopPath = Environment.GetFolderPath(Environment.SpecialFolder.Desktop);
+        string csvPath = Path.Combine(desktopPath, $"{userName}.csv");
+
+        using (var writer = new StreamWriter(csvPath, false, Encoding.UTF8))
+        {
+            // Write header
+            writer.WriteLine("Url,Views,Likes,Comments,Shares");
+
+            // Write each row
+            foreach (var metaData in metadatas)
+            {
+                string line = $"\"{metaData.Url}\"," +
+                              $"\"{metaData.Views}\"," +
+                              $"\"{metaData.Likes}\"," +
+                              $"\"{metaData.Comments}\"," +
+                              $"\"{metaData.Shares}\",";
+
+                writer.WriteLine(line);
+            }
+        }
+
+        Console.WriteLine($"✅ CSV saved to: {Path.GetFullPath(csvPath)}");
+    }
+        
+    static string TakeUsername()
+    {
+        Console.Write("Write Username : ");
+
+        var username = Console.ReadLine();
+
+        if (string.IsNullOrWhiteSpace(username))
+        {
+            Console.WriteLine("❌ Username cannot be empty.");
+            throw new Exception("No no no");
+        }
+
+        return username.Trim().Replace(" ", "");
+    }
+
+}
+
+/*    static async Task GetVideoLinks()
     {
         var profileUrl = "https://www.tiktok.com/@22gradusi"; // 👈 change this
         var linksFile = "video_links.txt";
@@ -187,107 +299,4 @@ class Program
 
         Console.WriteLine($"\n✅ Done. Saved to '{outputFile}'.");
         Console.ReadKey();
-    }
-
-    static async Task<string> GetText(IPage page, string selector)
-    {
-        try
-        {
-            var el = await page.QuerySelectorAsync(selector);
-            return el != null ? (await el.InnerTextAsync()) : "N/A";
-        }
-        catch
-        {
-            return "N/A";
-        }
-    }
-}
-
-
-/*using Microsoft.Playwright;
-
-class Program
-{
-    public static async Task Main()
-    {
-        using var playwright = await Playwright.CreateAsync();
-        var browser = await playwright.Chromium.LaunchAsync(new BrowserTypeLaunchOptions
-        {
-            Headless = false, // Try headless: true after debugging
-        });
-
-        var context = await browser.NewContextAsync(new BrowserNewContextOptions
-        {
-            UserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64)...", // Spoof UA
-        });
-
-        var page = await context.NewPageAsync();
-
-        var url = "https://www.tiktok.com/@22gradusi";
-        await page.GotoAsync(url, new PageGotoOptions
-        {
-            WaitUntil = WaitUntilState.NetworkIdle,
-            Timeout = 30000
-        });
-
-        // Wait for at least one video thumbnail to load
-        await page.WaitForSelectorAsync("div[data-e2e='user-post-item']");
-
-        var videoLinks = await page.EvalOnSelectorAllAsync<string[]>(
-            "a[href*='/video/']",
-            "els => els.map(e => e.href)"
-        );
-
-        foreach (var link in videoLinks.Distinct())
-        {
-            Console.WriteLine($"Video link: {link}");
-        }
-
-        await browser.CloseAsync();
-    }
-}
-*/
-
-/*using System.Threading.Tasks;
-using Microsoft.Playwright;
-
-class Program
-{
-    public static async Task Main()
-    {
-        var username = "22gradusi";
-        var url = $"https://www.tiktok.com/@{username}";
-
-        using var playwright = await Playwright.CreateAsync();
-        var browser = await playwright.Chromium.LaunchAsync(new BrowserTypeLaunchOptions
-        {
-            Headless = true
-        });
-
-        var context = await browser.NewContextAsync(new BrowserNewContextOptions
-        {
-            UserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
-                        "(KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36"
-        });
-
-        var page = await context.NewPageAsync();
-        await page.GotoAsync(url, new PageGotoOptions { WaitUntil = WaitUntilState.NetworkIdle });
-
-        // Wait for profile info to load
-        await page.WaitForSelectorAsync("h2[data-e2e='user-subtitle']");
-
-        var name = await page.InnerTextAsync("h2[data-e2e='user-subtitle']");
-        var followers = await page.InnerTextAsync("strong[data-e2e='followers-count']");
-        var likes = await page.InnerTextAsync("strong[data-e2e='likes-count']");
-
-        Console.WriteLine($"Username: {username}");
-        Console.WriteLine($"Name: {name}");
-        Console.WriteLine($"Followers: {followers}");
-        Console.WriteLine($"Likes: {likes}");
-
-        await browser.CloseAsync();
-    }
-}
-
-
-*/
+    }*/
