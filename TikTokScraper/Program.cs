@@ -7,17 +7,17 @@ class Program
     static async Task Main(string[] args)
     {
         var username = TakeUsername();
-        var result = await GetVideoLinksAndViews(username);
-        var metadata =  await GetVideoStuff(result);
+        var targetCount = TakeTargetCount();
+
+        var result = await GetVideoLinksAndViews(username, targetCount);
+        var metadata = await GetVideoStuff(result);
 
         CreateCSVFile(metadata, username);
     }
 
-    static async Task<List<(string Url, string Views)>> GetVideoLinksAndViews(string username)
+    static async Task<List<(string Url, string Views)>> GetVideoLinksAndViews(string username, int targetCount)
     {
         var profileUrl = "https://www.tiktok.com/@" + username;
-        int targetCount = 1435;
-        int scrollDelayMs = 1200;
 
         using var playwright = await Playwright.CreateAsync();
         await using var browser = await playwright.Chromium.LaunchAsync(new() { Headless = false });
@@ -29,45 +29,65 @@ class Program
 
         var results = new List<(string Url, string Views)>();
         int scrolls = 0;
+        int maxCount = 140;
+        int scrollDelayMs = 1200;
+        bool browserClosedByUser = false;
 
-        while (results.Count < targetCount && scrolls < 300)
+        browser.Disconnected += (_, _) =>
         {
-            // Ensure enough items have loaded
-            await page.WaitForSelectorAsync("div[data-e2e='user-post-item']");
+            Console.WriteLine("⚠️ Browser was closed by the user!");
+            browserClosedByUser = true;
+        };
 
-            // Grab all containers
-            var items = await page.QuerySelectorAllAsync("div[data-e2e='user-post-item']");
+        while (results.Count < targetCount && scrolls < maxCount)
+        {
+            if (browserClosedByUser)
+                break;
 
-            foreach (var item in items)
+            try
             {
-                // Extract the <a> href
-                var linkHandle = await item.QuerySelectorAsync("a[href*='/video/']");
-                if (linkHandle == null) continue;
-                var url = await linkHandle.GetAttributeAsync("href");
+                // Ensure enough items have loaded
+                await page.WaitForSelectorAsync("div[data-e2e='user-post-item']");
 
-                // Extract the <strong> text (views)
-                var viewsHandle = await item.QuerySelectorAsync("strong[data-e2e='video-views']");
-                var views = viewsHandle is not null
-                    ? (await viewsHandle.InnerTextAsync()).Trim()
-                    : "N/A";
+                // Grab all containers
+                var items = await page.QuerySelectorAllAsync("div[data-e2e='user-post-item']");
 
-                // Avoid duplicates
-                if (results.Any(r => r.Url == url)) continue;
-                results.Add((url, views));
-                
-                Console.WriteLine($"[{results.Count}] {url}  —  {views}");
+                foreach (var item in items)
+                {
+                    // Extract the <a> href
+                    var linkHandle = await item.QuerySelectorAsync("a[href*='/video/']");
+                    if (linkHandle == null) continue;
+                    var url = await linkHandle.GetAttributeAsync("href");
+
+                    // Extract the <strong> text (views)
+                    var viewsHandle = await item.QuerySelectorAsync("strong[data-e2e='video-views']");
+                    var views = viewsHandle is not null
+                        ? (await viewsHandle.InnerTextAsync()).Trim()
+                        : "N/A";
+
+                    // Avoid duplicates
+                    if (results.Any(r => r.Url == url)) continue;
+                    results.Add((url, views));
+
+                    Console.WriteLine($"[{results.Count}] {url}  —  {views} - Scroll Count {scrolls}");
+
+                    if (results.Count >= targetCount)
+                        break;
+                }
 
                 if (results.Count >= targetCount)
                     break;
+                // Scroll to load more videos
+                await page.EvaluateAsync("window.scrollBy(0, window.innerHeight)");
+                await Task.Delay(scrollDelayMs);
+                Console.WriteLine("Scroll Count : " + scrolls + "/" + maxCount);
+                scrolls++;
             }
-
-            if (results.Count >= targetCount)
-                break;
-
-            // Scroll to load more videos
-            await page.EvaluateAsync("window.scrollBy(0, window.innerHeight)");
-            await Task.Delay(scrollDelayMs);
-            scrolls++;
+            catch (Exception ex)
+            {
+                Console.WriteLine($"❌ Error during scroll {scrolls}: {ex.Message}");
+                break; // Exit on error
+            }
         }
 
         Console.WriteLine($"✅ Finished. Collected {results.Count} items.");
@@ -78,23 +98,27 @@ class Program
     static async Task<List<VideoMetadata>> GetVideoStuff(List<(string Url, string Views)> urlViews)
     {
         List<VideoMetadata> videoMetadatas = new();
+
         using var playwright = await Playwright.CreateAsync();
         var browser = await playwright.Chromium.LaunchAsync(new() { Headless = false });
         var context = await browser.NewContextAsync();
         var page = await context.NewPageAsync();
 
         Console.WriteLine($"🔍 Scraping {urlViews.Count} videos...\n");
-
+        int count = 0;
         foreach (var urlView in urlViews)
         {
             try
             {
+                count++;
                 await page.GotoAsync(urlView.Url, new() { WaitUntil = WaitUntilState.NetworkIdle, Timeout = 30000 });
                 await page.WaitForTimeoutAsync(1500); // Let JS render fully
 
                 string likes = await GetText(page, "strong[data-e2e='like-count']");
                 string comments = await GetText(page, "strong[data-e2e='comment-count']");
                 string shares = await GetText(page, "strong[data-e2e='share-count']");
+
+                string uploadTime = await GetText(page, "span[data-e2e='browser-nickname'] span:last-child");
 
                 VideoMetadata videoMetadata = new VideoMetadata
                 {
@@ -103,11 +127,11 @@ class Program
                     Likes = likes,
                     Comments = comments,
                     Shares = shares,
-                    Caption = await GetText(page, "h1[data-e2e='video-caption']"),
-                    UploadTime = await GetText(page, "span[data-e2e='video-upload-time']")
-                };  
+                    UploadTime = uploadTime
+                };
 
-                string result = $"{urlView.Url} : comments({comments}), likes({likes}), shares({shares}), views({urlView.Views})";
+                string result = $"({count}) - {urlView.Url} : views({urlView.Views}), likes({likes}), comments({comments}), shares({shares}), " +
+                $"uploaded({uploadTime})";
 
                 Console.WriteLine(result);
 
@@ -115,7 +139,7 @@ class Program
             }
             catch (Exception ex)
             {
-                string failMsg = $"❌ Failed to scrape {urlView.Url}: {ex.Message}";
+                string failMsg = $"At count {count} ❌ Failed to scrape {urlView.Url}: {ex.Message}";
                 Console.WriteLine(failMsg);
             }
         }
@@ -123,7 +147,7 @@ class Program
         Console.WriteLine($"\n✅ Done. Saved to List.");
         return videoMetadatas;
     }
-    
+
     static async Task<string> GetText(IPage page, string selector)
     {
         try
@@ -136,7 +160,7 @@ class Program
             return "N/A";
         }
     }
-    
+
     static void CreateCSVFile(List<VideoMetadata> metadatas, string userName)
     {
         string desktopPath = Environment.GetFolderPath(Environment.SpecialFolder.Desktop);
@@ -145,7 +169,7 @@ class Program
         using (var writer = new StreamWriter(csvPath, false, Encoding.UTF8))
         {
             // Write header
-            writer.WriteLine("Url,Views,Likes,Comments,Shares");
+            writer.WriteLine("Url,Views,Likes,Comments,Shares,UploadTime");
 
             // Write each row
             foreach (var metaData in metadatas)
@@ -154,7 +178,8 @@ class Program
                               $"\"{metaData.Views}\"," +
                               $"\"{metaData.Likes}\"," +
                               $"\"{metaData.Comments}\"," +
-                              $"\"{metaData.Shares}\",";
+                              $"\"{metaData.Shares}\"," +
+                              $"\"{metaData.UploadTime}\",";
 
                 writer.WriteLine(line);
             }
@@ -162,7 +187,7 @@ class Program
 
         Console.WriteLine($"✅ CSV saved to: {Path.GetFullPath(csvPath)}");
     }
-        
+
     static string TakeUsername()
     {
         Console.Write("Write Username : ");
@@ -178,6 +203,29 @@ class Program
         return username.Trim().Replace(" ", "");
     }
 
+    static int TakeTargetCount()
+    {
+        Console.Write("Write Video Count : ");
+
+        var input = Console.ReadLine();
+        var tryparse = int.TryParse(input, out int count);
+
+        if (input.Any(char.IsWhiteSpace))
+        {
+            Console.WriteLine("Error: no spaces allowed.");
+        }
+        else if (tryparse)
+        {
+            Console.WriteLine($"You entered the integer {count}.");
+        }
+        else
+        {
+            Console.WriteLine("Error: please enter only digits.");
+            return 0;
+        }
+
+        return count;
+    }
 }
 
 /*    static async Task GetVideoLinks()
