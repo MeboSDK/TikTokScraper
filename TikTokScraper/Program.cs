@@ -1,21 +1,29 @@
 ﻿using Microsoft.Playwright;
+using System.Collections.Concurrent;
 using System.Text;
+using System.Threading.Channels;
 using TikTokScraper;
 
 class Program
 {
+
     static async Task Main(string[] args)
     {
         var username = TakeUsername();
         var targetCount = TakeTargetCount();
+        
+        var channel = Channel.CreateUnbounded<(string Url, string Views)>();
+        var resultsBag = new ConcurrentBag<VideoMetadata>();
 
-        var result = await GetVideoLinksAndViews(username, targetCount);
-        var metadata = await GetVideoStuff(result);
+        var producer = GetVideoLinksAndViews(channel.Writer, username, targetCount);
+        var consumer = GetVideoStuff(channel.Reader, resultsBag);
 
-        CreateCSVFile(metadata, username);
+        await Task.WhenAll(producer, consumer);
+
+        CreateCSVFile(resultsBag, username);
     }
 
-    static async Task<List<(string Url, string Views)>> GetVideoLinksAndViews(string username, int targetCount)
+    static async Task GetVideoLinksAndViews(ChannelWriter<(string Url, string Views)> writer, string username, int targetCount)
     {
         var profileUrl = "https://www.tiktok.com/@" + username;
 
@@ -27,7 +35,6 @@ class Program
         await page.GotoAsync(profileUrl, new() { WaitUntil = WaitUntilState.NetworkIdle });
         Console.WriteLine("✅ Page loaded. Starting scroll…");
 
-        var results = new List<(string Url, string Views)>();
         int scrolls = 0;
         int maxCount = 140;
         int scrollDelayMs = 1200;
@@ -39,7 +46,10 @@ class Program
             browserClosedByUser = true;
         };
 
-        while (results.Count < targetCount && scrolls < maxCount)
+
+        var seen = new HashSet<string>();
+
+        while (seen.Count < targetCount && scrolls < maxCount)
         {
             if (browserClosedByUser)
                 break;
@@ -66,17 +76,16 @@ class Program
                         : "N/A";
 
                     // Avoid duplicates
-                    if (results.Any(r => r.Url == url)) continue;
-                    results.Add((url, views));
-
-                    Console.WriteLine($"[{results.Count}] {url}  —  {views} - Scroll Count {scrolls}");
-
-                    if (results.Count >= targetCount)
-                        break;
+                    if (seen.Add(url))
+                    {
+                        // publish into the channel immediately
+                        await writer.WriteAsync((url, views));
+                        Console.WriteLine($"[P] {seen.Count}: {url} — {views}");
+                        if (seen.Count >= targetCount) break;
+                    }
                 }
 
-                if (results.Count >= targetCount)
-                    break;
+                if (seen.Count >= targetCount) break;
                 // Scroll to load more videos
                 await page.EvaluateAsync("window.scrollBy(0, window.innerHeight)");
                 await Task.Delay(scrollDelayMs);
@@ -90,12 +99,10 @@ class Program
             }
         }
 
-        Console.WriteLine($"✅ Finished. Collected {results.Count} items.");
-
-        return results;
+        Console.WriteLine($"✅ Finished. Collected {seen.Count} links.");
     }
 
-    static async Task<List<VideoMetadata>> GetVideoStuff(List<(string Url, string Views)> urlViews)
+    static async Task<List<VideoMetadata>> GetVideoStuff(ChannelReader<(string Url, string Views)> reader, ConcurrentBag<VideoMetadata> resultsBag)
     {
         List<VideoMetadata> videoMetadatas = new();
 
@@ -104,14 +111,14 @@ class Program
         var context = await browser.NewContextAsync();
         var page = await context.NewPageAsync();
 
-        Console.WriteLine($"🔍 Scraping {urlViews.Count} videos...\n");
+        Console.WriteLine($"🔍 Scraping videos...\n");
         int count = 0;
-        foreach (var urlView in urlViews)
+        await foreach (var (url, views) in reader.ReadAllAsync())
         {
             try
             {
                 count++;
-                await page.GotoAsync(urlView.Url, new() { WaitUntil = WaitUntilState.NetworkIdle, Timeout = 30000 });
+                await page.GotoAsync(url, new() { WaitUntil = WaitUntilState.NetworkIdle, Timeout = 30000 });
                 await page.WaitForTimeoutAsync(1500); // Let JS render fully
 
                 string likes = await GetText(page, "strong[data-e2e='like-count']");
@@ -122,24 +129,20 @@ class Program
 
                 VideoMetadata videoMetadata = new VideoMetadata
                 {
-                    Url = urlView.Url,
-                    Views = urlView.Views,
+                    Url = url,
+                    Views = views,
                     Likes = likes,
                     Comments = comments,
                     Shares = shares,
                     UploadTime = uploadTime
                 };
 
-                string result = $"({count}) - {urlView.Url} : views({urlView.Views}), likes({likes}), comments({comments}), shares({shares}), " +
-                $"uploaded({uploadTime})";
-
-                Console.WriteLine(result);
-
-                videoMetadatas.Add(videoMetadata);
+                resultsBag.Add(videoMetadata);
+                Console.WriteLine($"[C] {count}: {url} → views({views}), likes({likes}), comments({comments}), shares({shares})");
             }
             catch (Exception ex)
             {
-                string failMsg = $"At count {count} ❌ Failed to scrape {urlView.Url}: {ex.Message}";
+                string failMsg = $"At count {count} ❌ Failed to scrape {url}: {ex.Message}";
                 Console.WriteLine(failMsg);
             }
         }
@@ -161,7 +164,7 @@ class Program
         }
     }
 
-    static void CreateCSVFile(List<VideoMetadata> metadatas, string userName)
+    static void CreateCSVFile(IEnumerable<VideoMetadata> metadatas, string userName)
     {
         string desktopPath = Environment.GetFolderPath(Environment.SpecialFolder.Desktop);
         string csvPath = Path.Combine(desktopPath, $"{userName}.csv");
